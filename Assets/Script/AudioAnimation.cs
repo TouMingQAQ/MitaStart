@@ -6,11 +6,13 @@ using CSCore.Streams;
 using Newtonsoft.Json;
 using UnityEngine;
 using VInspector;
+
 public enum MusicHeadVersion
 {
     V1 = 1,
     V2 = 2
 }
+
 [Serializable]
 public class MusicHeadConfig
 {
@@ -31,14 +33,17 @@ public class MusicHeadConfig
         public float SmoothingFactor = 0.7f; // 平滑滤波因子
     }
 }
+
 public class AudioAnimation : MonoBehaviour
 {
     private const int BufferSize = 2048;   // 缓冲区大小
+    private const int SampleRate = 44100;  // 采样率
 
     private WasapiLoopbackCapture capture;
     private SoundInSource soundInSource;
     private MMDeviceEnumerator _enumerator;
     private byte[] buffer;
+    private float[] audioSamplesBuffer; // 预分配的音频样本缓冲区
     [SerializeField]
     private float[] audioSamples;
     private int offset;
@@ -78,6 +83,13 @@ public class AudioAnimation : MonoBehaviour
     // 添加 nodEnergy 属性
     public float nodEnergy { get; private set; }
     private bool isMusic = false; // 新增：用于存储音乐检测结果
+    private bool IsListening;
+    // 4个队列用于存储音频特征值
+    private float[] zeroCrossingRateHistory = new float[10];
+    private float[] shortTimeEnergyHistory = new float[10];
+    private float[] spectralCentroidHistory = new float[10];
+    private float[] spectralFlatnessHistory = new float[10];
+    private int historyIndex = 0;
 
     private void Awake()
     {
@@ -93,6 +105,8 @@ public class AudioAnimation : MonoBehaviour
         soundInSource = new SoundInSource(capture);
         soundInSource.DataAvailable += OnDataAvailable;
         _enumerator = new MMDeviceEnumerator();
+
+        audioSamplesBuffer = new float[BufferSize / sizeof(float)]; // 预分配缓冲区
     }
     void LoadConfig()
     {
@@ -133,14 +147,15 @@ public class AudioAnimation : MonoBehaviour
     }
     void ResetCapture()
     {
+        DisposeAudioCapture();
+        InitializeAudioCapture();
+    }
+
+    private void DisposeAudioCapture()
+    {
         capture.Stop();
         capture.Dispose();
         soundInSource.Dispose();
-        capture = new WasapiLoopbackCapture();
-        capture.Initialize();
-        capture.Start();
-        soundInSource = new SoundInSource(capture);
-        soundInSource.DataAvailable += OnDataAvailable;
     }
     
     private void OnApplicationQuit()
@@ -199,12 +214,16 @@ public class AudioAnimation : MonoBehaviour
         int sampleCount = byteCount / sizeof(float);
         int startCount = offset / sizeof(float);
         int count = sampleCount - startCount;
-        audioSamples = new float[count];
+        if (count > audioSamplesBuffer.Length)
+        {
+            count = audioSamplesBuffer.Length;
+        }
+
         float energy = 0;
-        for (int i = startCount; i < sampleCount; i++)
+        for (int i = startCount; i < startCount + count; i++)
         {
             var sample = BitConverter.ToSingle(buffer, i * sizeof(float));
-            audioSamples[i - startCount] = sample; // Corrected index
+            audioSamplesBuffer[i - startCount] = sample; // 存储解析后的音频样本
             energy += sample * sample; // 能量为振幅的平方和
         }
         energy /= count; // 平均能量
@@ -221,7 +240,7 @@ public class AudioAnimation : MonoBehaviour
             averageEnergy = averageEnergy * energyDecayFactor + energy * (1 - energyDecayFactor);
 
             // 检查是否为音乐
-            isMusic = CheckIsMusic(audioSamples); // 实时更新音乐检测结果
+            isMusic = CheckIsMusic(); // 实时更新音乐检测结果
 
             // 自适应阈值检测（仅当是音乐时）
             if (isMusic)
@@ -243,43 +262,143 @@ public class AudioAnimation : MonoBehaviour
             disEnergy = currentEnergy - energy;
             currentEnergy = energy;
             if (currentEnergy > nodMinEnergy && disEnergy > 0)
+            {
                 nod = true;
+            }
         }
-    
+
+        // 将解析后的音频样本复制到 audioSamples 中，供 CheckIsMusic 方法使用
+        Array.Copy(audioSamplesBuffer, 0, audioSamples, 0, count);
     }
 
-    private float CalculateZeroCrossingRate(float[] audioSamples)
+    public bool CheckIsMusic()
+    {
+        if (!IsListening)
+        {
+            return false;
+        }
+
+        try
+        {
+            // 合并计算过零率和短时能量
+            float[] audioFeatures = CalculateAudioFeatures(audioSamples);
+            float zeroCrossingRate = audioFeatures[0];
+            float shortTimeEnergy = audioFeatures[1];
+            float spectralCentroid = CalculateSpectralCentroid(audioSamples, SampleRate);
+            float spectralFlatness = CalculateSpectralFlatness(audioSamples);
+
+            // 更新历史数据
+            zeroCrossingRateHistory[historyIndex] = zeroCrossingRate;
+            shortTimeEnergyHistory[historyIndex] = shortTimeEnergy;
+            spectralCentroidHistory[historyIndex] = spectralCentroid;
+            spectralFlatnessHistory[historyIndex] = spectralFlatness;
+
+            historyIndex = (historyIndex + 1) % 10;
+
+            // 计算平均值
+            float avgZeroCrossingRate = CalculateAverage(zeroCrossingRateHistory);
+            float avgShortTimeEnergy = CalculateAverage(shortTimeEnergyHistory);
+            float avgSpectralCentroid = CalculateAverage(spectralCentroidHistory);
+            float avgSpectralFlatness = CalculateAverage(spectralFlatnessHistory);
+
+            const float zeroCrossingRateThreshold = 0.05f;
+            const float shortTimeEnergyThreshold = 0.01f;
+            const float spectralCentroidThreshold = 1000.0f; // 1000 Hz
+            const float spectralFlatnessThreshold = 0.5f;
+
+            return avgZeroCrossingRate > zeroCrossingRateThreshold &&
+                avgShortTimeEnergy > shortTimeEnergyThreshold &&
+                avgSpectralCentroid > spectralCentroidThreshold &&
+                avgSpectralFlatness > spectralFlatnessThreshold;
+        }
+        catch (Exception ex)
+        {
+            return false;
+        }
+    }
+
+    private float[] CalculateAudioFeatures(float[] audioSamples)
     {
         int zeroCrossingCount = 0;
+        float energySum = 0;
+
+        // 计算过零率和能量
         for (int i = 1; i < audioSamples.Length; i++)
         {
             if (audioSamples[i] * audioSamples[i - 1] < 0)
             {
                 zeroCrossingCount++;
             }
+            energySum += audioSamples[i] * audioSamples[i];
         }
-        return (float)zeroCrossingCount / audioSamples.Length;
+        float energy = energySum / audioSamples.Length;
+
+        // 计算过零率
+        float zeroCrossingRate = (float)zeroCrossingCount / audioSamples.Length;
+
+        return new float[] { zeroCrossingRate, energy };
     }
 
-    private float CalculateShortTimeEnergy(float[] audioSamples)
+    private float CalculateSpectralCentroid(float[] audioSamples, int sampleRate)
     {
-        float energy = 0;
-        foreach (float sample in audioSamples)
+        float numerator = 0;
+        float denominator = 0;
+        float[] magnitudes = new float[audioSamples.Length / 2];
+
+        // 计算频谱
+        for (int i = 0; i < audioSamples.Length / 2; i++)
         {
-            energy += sample * sample;
+            magnitudes[i] = (float)Math.Sqrt(audioSamples[2 * i] * audioSamples[2 * i] + audioSamples[2 * i + 1] * audioSamples[2 * i + 1]);
         }
-        return energy / audioSamples.Length;
+
+        // 计算频谱质心
+        for (int i = 0; i < magnitudes.Length; i++)
+        {
+            float frequency = i * (float)sampleRate / audioSamples.Length;
+            numerator += frequency * magnitudes[i];
+            denominator += magnitudes[i];
+        }
+
+        return numerator / denominator;
     }
 
-    private bool CheckIsMusic(float[] audioSamples)
+    private float CalculateSpectralFlatness(float[] audioSamples)
     {
-        float zeroCrossingRate = CalculateZeroCrossingRate(audioSamples);
-        float shortTimeEnergy = CalculateShortTimeEnergy(audioSamples);
-        return zeroCrossingRate > zeroCrossingRateThreshold && shortTimeEnergy > shortTimeEnergyThreshold;
+        float geometricMean = 0;
+        float arithmeticMean = 0;
+
+        // 计算频谱
+        float[] magnitudes = new float[audioSamples.Length / 2];
+        for (int i = 0; i < audioSamples.Length / 2; i++)
+        {
+            magnitudes[i] = (float)Math.Sqrt(audioSamples[2 * i] * audioSamples[2 * i] + audioSamples[2 * i + 1] * audioSamples[2 * i + 1]);
+        }
+
+        // 计算几何平均和算术平均
+        for (int i = 0; i < magnitudes.Length; i++)
+        {
+            geometricMean += (float)Math.Log(magnitudes[i]);
+            arithmeticMean += magnitudes[i];
+        }
+
+        geometricMean = (float)Math.Exp(geometricMean / magnitudes.Length);
+        arithmeticMean /= magnitudes.Length;
+
+        return geometricMean / arithmeticMean;
     }
 
     private float SmoothingFilter(float value)
     {
         return smoothingFactor * previousEnergy + (1 - smoothingFactor) * value;
+    }
+
+    private float CalculateAverage(float[] array)
+    {
+        float sum = 0;
+        foreach (float value in array)
+        {
+            sum += value;
+        }
+        return sum / array.Length;
     }
 }
